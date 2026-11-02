@@ -31,13 +31,37 @@ Work in small, verifiable steps. Never declare success without a green build, gr
 - Do not touch secrets, connection strings or environment-specific config.
 - Keep a running checklist with the todo tool so progress is visible.
 - If the work tree is dirty when you start, stop and ask the user to commit or stash first.
-- All work happens on a dedicated branch named **`remove-automapper`** (§2). Never commit to `main`/`master`/`develop`.
-- **Nothing is committed or pushed unless `dotnet build` and `dotnet test` pass and every API starts locally with
-  Swagger working** (§10).
+- **First action before changing any file:** create the branch **`remove-automapper`** (§2). All work happens
+  there. Never commit to `main`/`master`/`develop`.
+- **Nothing is committed unless `dotnet build` and `dotnet test` pass and every API starts locally with Swagger
+  working** (§10). **Nothing is pushed until the full pre-push check passes** on the final state: build → tests →
+  run the API(s) if the solution has any (§10b).
+- Mapper names are descriptive, named after the mapped type (`LandedCost` → `LandedCostMapper`), and mappers live
+  in a `Mappers` folder (§1a).
 
 ### Target design (decided by the team — follow it exactly)
 
-**Mappers: injectable classes, one per AutoMapper profile (or per feature area)**
+**Mappers: injectable classes, one per mapped domain type, with a descriptive name**
+
+Naming rule — the mapper is named after the **domain/source type it maps**, never after the profile or a generic
+word:
+
+| Mapped type                  | Interface              | Class                 | File                    |
+|------------------------------|------------------------|-----------------------|-------------------------|
+| `LandedCost`                 | `ILandedCostMapper`    | `LandedCostMapper`    | `Mappers/LandedCostMapper.cs` |
+| `Customer`                   | `ICustomerMapper`      | `CustomerMapper`      | `Mappers/CustomerMapper.cs`   |
+| `PurchaseOrderLine`          | `IPurchaseOrderLineMapper` | `PurchaseOrderLineMapper` | `Mappers/PurchaseOrderLineMapper.cs` |
+
+- All maps of the same domain type go in its mapper, in both directions: `LandedCost → LandedCostDto`,
+  `CreateLandedCostRequest → LandedCost`, `LandedCost → LandedCostResponse` are all methods of `LandedCostMapper`.
+- A generic profile (`MappingProfile`, `AutoMapperProfile`, `DtoProfile`) that maps many types is **split** into one
+  mapper per domain type. Never create `MappingProfileMapper`, `GeneralMapper`, `CommonMapper`, `DtoMapper`.
+- Pick the domain type as the name (the entity / domain model), not the DTO: `LandedCostMapper`, not
+  `LandedCostDtoMapper`. If a map has no domain type on either side (DTO → DTO), name it after the source type.
+- If a type name collides with an existing class in the same namespace, ask instead of inventing a variant.
+- Interface in the same folder, own file (`ILandedCostMapper.cs`), unless the repo keeps interfaces elsewhere
+  (e.g. an `Interfaces`/`Abstractions` folder) — then follow the repo.
+
 
 ```csharp
 public interface ICustomerMapper
@@ -70,8 +94,8 @@ public sealed class CustomerMapper : ICustomerMapper
   needs a scoped service (e.g. a value resolver that used a `DbContext`).
 - A mapper may inject **other mapper interfaces** for nested objects (`IAddressMapper`) — never `IServiceProvider`.
   Avoid circular mapper dependencies; if two mappers need each other, use private methods instead.
-- Put the mapper next to the profile it replaces (same project and folder, e.g. `Mappings/CustomerMapper.cs`),
-  unless the repo already has a clear convention for mappers.
+- Location: the `Mappers` folder chosen in §1a, namespace matching the folder
+  (`<Project>.Mappers`, or the repo's existing namespace convention).
 - Use named arguments in constructor calls when the destination has more than ~3 parameters or several parameters
   of the same type — it prevents swapped values.
 - No reflection, no generic "mapper" base class, no new mapping library.
@@ -145,7 +169,36 @@ global configuration (`cfg.AllowNullCollections`, `cfg.AllowNullDestinationValue
 Report the inventory size to the user (number of profiles, maps, call sites, `ProjectTo` usages, tests) before
 continuing. If the solution is large, propose doing it in batches (one feature/profile per batch).
 
-## 2. Create the branch
+## 1a. Find (or create) the mappers folder
+
+1. Look for an existing mapper folder in the solution (case-insensitive):
+
+   ```bash
+   git ls-files | grep -iE '/(mappers?|mappings?)/' | sed -E 's#(.*/(mappers?|mappings?))/.*#\1#I' | sort -u
+   ```
+
+   ```powershell
+   git ls-files | Select-String -Pattern '^(.*/(mappers?|mappings?))/' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Sort-Object -Unique
+   ```
+
+   Folders named `Mapper`, `Mappers`, `Mapping` or `Mappings` count. A folder that only holds AutoMapper
+   `Profile`s counts too — the mappers go there and the profiles are deleted later (§9).
+2. **If exactly one fits** (it's in the project that does the mapping — see 3.), use it as is (keep its name, don't
+   rename `Mapping` to `Mappers`).
+3. **If none exists**, create a folder **`Mappers`** in the **proper class library** — the project that:
+   - currently contains the AutoMapper profiles / calls `IMapper` (usually the *Application* / *Services* /
+     *Business* layer), and
+   - references **both** the source and destination types of the maps.
+
+   Never put mappers in the *Domain*/*Core* project (no DTOs there), in a test project, or in the API/web project
+   unless that's the only project that both uses the maps and sees both types (e.g. small single-project APIs).
+4. **If several projects use AutoMapper** (e.g. Application maps entities ↔ DTOs, Api maps DTOs ↔ request/response
+   models), each project gets its own `Mappers` folder for the maps it owns — don't move maps across layers.
+5. **If there are several candidate folders, or the layering is unclear**, show the user the options and ask.
+
+Tell the user the chosen folder(s) before writing any mapper.
+
+## 2. Create the branch (first change — before touching any file)
 
 ```bash
 git fetch origin
@@ -156,7 +209,8 @@ git switch -c remove-automapper
 
 If `remove-automapper` already exists locally or on the remote, don't overwrite it — ask whether to continue on it
 or use `remove-automapper-2`. If you're the Copilot coding agent and the platform already gave you a branch, tell
-the user and use that one. Check with `git branch --show-current`.
+the user and use that one. Check with `git branch --show-current` — it must print `remove-automapper` before any
+file is edited.
 
 ## 3. Baseline
 
@@ -333,18 +387,49 @@ Commits — one per profile/feature batch (each passing the gate), or one at the
 ```bash
 git status                           # no logs, TestResults/, bin/, obj/
 git add -A
-git commit -m "Replace AutoMapper <Feature>Profile with <Feature>Mapper"
+git commit -m "Replace AutoMapper mapping of LandedCost with LandedCostMapper"
 # last one:
 git commit -m "Remove AutoMapper package and configuration"
-git push -u origin remove-automapper   # only if the user wants it pushed (ask once if unclear)
 ```
+
+## 10b. Pre-push check (mandatory, on the final state)
+
+Run this full sequence once more after the last commit, from a clean state, in this order. Stop at the first
+failure — **do not push**:
+
+```bash
+git branch --show-current            # 1. must be remove-automapper
+git status                           #    must be clean (everything committed, no logs/bin/obj)
+git grep -nE 'AutoMapper|IMapper\b|CreateMap<|ProjectTo<' -- '*.cs' '*.csproj' 'Directory.Packages.props'   # 2. must print nothing
+dotnet clean
+dotnet restore                       # 3. restore
+dotnet build --no-restore -c Release # 4. build: 0 errors, no new warnings vs baseline
+dotnet test --no-build -c Release    # 5. tests: everything that passed at baseline passes + new mapper tests pass
+```
+
+6. **Run the API(s), if the solution has any** — every project with `Sdk="Microsoft.NET.Sdk.Web"` (and workers if
+   any): do the Swagger smoke run from §10 for each one. Swagger UI 200, Swagger JSON 200, same operations as the
+   baseline, no new errors in the log (especially no `Unable to resolve service for type 'I…Mapper'`), then stop
+   it.
+   - If the solution has **no API project** (class libraries only), say so in the report and skip this step.
+   - If an API can't be started for environment reasons it also failed on at baseline (e.g. no local DB), report it
+     — that alone doesn't block the push.
+7. **Only when 1–6 pass**, push:
+
+   ```bash
+   git push -u origin remove-automapper
+   ```
+
+   If anything fails: fix it, commit the fix (through the §10 gate), and run the **whole** pre-push check again.
+   Never push with `--no-verify` or with failing checks. If you can't get it green, don't push — report what fails.
 
 Don't open a pull request unless asked; suggest one from `remove-automapper` into the default branch at the end.
 
 ## 11. Final report
 
-1. **Summary**: branch, commits, number of profiles/maps replaced, mappers created (list with file paths), DI
-   registration location, packages removed.
+1. **Summary**: branch, commits, pushed (yes/no), number of profiles/maps replaced, mappers created (list with
+   file paths), the `Mappers` folder(s) used or created and why, DI registration location, packages removed.
+   Include the pre-push check results (build, tests, API run per API).
 2. **Destination types**: converted to get-only + constructor (list), and types intentionally **not** converted
    with the reason (EF entity, updated in place, query-bound request, public package contract …).
 3. **Moved logic**: each piece of logic moved from profiles/resolvers/`AfterMap` into a mapper, with file
