@@ -1,6 +1,6 @@
 ---
 name: dotnet-lts-upgrade
-description: Upgrades a .NET solution to the latest LTS release (e.g. 6 → 8, 8 → 10) on a new upgrade-net<MAJOR> branch. Updates target frameworks, SDK pinning, NuGet packages, all pipeline YAML and Dockerfiles, fixes breaking changes, and commits only after build and tests pass.
+description: Upgrades a .NET solution to the latest LTS release (e.g. 6 → 8, 8 → 10) on a new upgrade-net<MAJOR> branch. Updates target frameworks, SDK pinning, NuGet packages, all pipeline YAML and Dockerfiles, fixes breaking changes, and commits only after build, tests and a local smoke run of the app pass.
 # No `tools:` list on purpose: the agent then gets every tool you have enabled
 # (read, edit, search, terminal/shell, web fetch, todo). If your organization
 # requires an explicit list, add for example:
@@ -29,7 +29,8 @@ Work in small, verifiable steps. Never declare success without a green `dotnet b
 - If the work tree is dirty when you start, stop and ask the user to commit or stash first.
 - All work happens on a dedicated branch named `upgrade-net<MAJOR>` (e.g. `upgrade-net10`, `upgrade-net12`) — see §2a.
   Never commit the upgrade directly to `main`/`master`/`develop`.
-- **Nothing is committed unless `dotnet build` and `dotnet test` pass** — see §11 (commit gate).
+- **Nothing is committed or pushed unless `dotnet build` and `dotnet test` pass and the app starts locally
+  without runtime errors** (smoke run, §10a) — see §11 (commit gate).
 - **Never upgrade a package into a paid / commercial-license version** (e.g. AutoMapper 15+, MediatR 13+).
   Stay on the **latest free version** instead — see §5a.
 
@@ -108,6 +109,8 @@ dotnet test --no-build
 
 Record the number of warnings, errors, and failing tests. Pre-existing failures are **not** yours to fix, but you
 must not add new ones. If the baseline doesn't build, report this to the user and ask how to proceed.
+
+Also do the **baseline smoke run** (§10a) now and record, per runnable project, whether it starts.
 
 ## 4. Retarget the projects
 
@@ -456,6 +459,128 @@ dotnet test --no-build
 - If there is a `dotnet format` config, run `dotnet format --verify-no-changes` and fix only upgrade-related issues.
 - If the repo builds Docker images, run `docker build` for at least one if Docker is available.
 
+## 10a. Smoke run — start the app locally (mandatory before commit/push)
+
+Build + tests are not enough: DI registration errors, missing configuration, middleware order, serializer and
+startup changes often only fail **when the app starts**. So every runnable project must be started locally and
+checked before anything is committed or pushed.
+
+### Which projects to run
+
+Find the runnable projects (skip test projects and class libraries):
+
+- `Sdk="Microsoft.NET.Sdk.Web"` → ASP.NET Core API / MVC / Razor / Blazor Server → **HTTP check**
+- `Sdk="Microsoft.NET.Sdk.Worker"` or `<OutputType>Exe</OutputType>` with a hosted service → **stays-alive check**
+- Plain console tools (`<OutputType>Exe</OutputType>`, exits by itself) → run only if it has a safe no-op mode
+  (`--help`, `--version`, dry run); otherwise skip and report.
+- Azure Functions → run with `func start` only if Azure Functions Core Tools are installed; otherwise skip and report.
+- Blazor WebAssembly / MAUI / WPF / WinForms → no smoke run; `dotnet publish` must succeed instead.
+
+If there are many runnable projects, run the main ones (API hosts, workers) and ask the user if unsure which.
+
+### Safety rules (very important)
+
+- Run with `ASPNETCORE_ENVIRONMENT=Development` / `DOTNET_ENVIRONMENT=Development` — **never** Production/Staging.
+- Before starting, read `appsettings.json` + `appsettings.Development.json` + user secrets + `launchSettings.json`.
+  If a connection string / service URL points to a **non-local** host (anything other than `localhost`,
+  `127.0.0.1`, `(localdb)`, `host.docker.internal`, a docker-compose service name), **do not start the app** —
+  ask the user. The app may run EF migrations, seed data, send emails or consume real queues on startup.
+- If the repo has a `docker-compose*.yml` for local dependencies (SQL Server, Postgres, Redis, RabbitMQ …) and
+  Docker is available, start only those dependency services (`docker compose up -d <db> <redis> …`) and stop them
+  afterwards (`docker compose down`).
+- Always stop every process you started, even when the check fails.
+
+### Baseline first
+
+Do the smoke run once **before** the upgrade (part of §3) and record the result per project. If an app didn't
+start at baseline either (e.g. needs a database you don't have), that is not an upgrade regression — report it and
+treat that project as "not smoke-testable", don't try to fix the environment.
+
+### HTTP check (web projects)
+
+Pick a free local port, start the app from its build output, wait until it answers, then stop it.
+
+```bash
+# bash / Linux / macOS
+export ASPNETCORE_ENVIRONMENT=Development
+dotnet run --project src/MyApi/MyApi.csproj -c Release --no-build --no-launch-profile -- \
+  --urls http://127.0.0.1:5099 > smoke.log 2>&1 &
+APP_PID=$!
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5099/health || true)
+  [ "$code" != "000" ] && break; sleep 2
+done
+echo "HTTP $code"; kill $APP_PID; wait $APP_PID 2>/dev/null
+grep -nE 'Unhandled exception|crit:|fail:|Exception:' smoke.log
+```
+
+```powershell
+# PowerShell / Windows
+$env:ASPNETCORE_ENVIRONMENT = "Development"
+$p = Start-Process dotnet -ArgumentList 'run --project src/MyApi/MyApi.csproj -c Release --no-build --no-launch-profile -- --urls http://127.0.0.1:5099' `
+     -RedirectStandardOutput smoke.log -RedirectStandardError smoke.err.log -PassThru -NoNewWindow
+$code = 0
+for ($i = 0; $i -lt 60 -and $code -eq 0; $i++) {
+  try { $code = (Invoke-WebRequest http://127.0.0.1:5099/health -UseBasicParsing -TimeoutSec 2).StatusCode }
+  catch { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } else { Start-Sleep 2 } }
+}
+"HTTP $code"; Stop-Process -Id $p.Id -Force
+Select-String -Path smoke.log, smoke.err.log -Pattern 'Unhandled exception|crit:|fail:|Exception:'
+```
+
+Which URL to call, in this order (use the first one the app has): the health check endpoint
+(`MapHealthChecks("/health" | "/healthz" | "/hc")`), `/swagger/index.html` or `/openapi/v1.json`, a simple anonymous
+GET endpoint, otherwise `/`.
+
+**Pass** when all of these hold:
+- the process is still running after startup (didn't exit/crash),
+- the URL returned a status **< 500** (401/403/404 are OK — the app is up; 5xx or no answer within ~2 min is a fail),
+- the log contains no `Unhandled exception`, `crit:` or startup `fail:` entries that weren't there at baseline
+  (e.g. DI `Unable to resolve service for type ...`, `InvalidOperationException` at startup, options validation
+  errors, EF model/migration errors).
+
+### Stays-alive check (workers / background services)
+
+Start it the same way (no URL), wait ~30 seconds, then check: the process is still running and the log has no new
+`Unhandled exception` / `crit:` / `fail:` entries compared to baseline. Then stop it.
+
+### Container check (if the repo has a Dockerfile and Docker is available)
+
+```bash
+docker build -t upgrade-smoke -f src/MyApi/Dockerfile .
+docker run -d --name upgrade-smoke -p 5098:8080 -e ASPNETCORE_ENVIRONMENT=Development upgrade-smoke
+# same HTTP check against http://127.0.0.1:5098/health, then:
+docker logs upgrade-smoke; docker rm -f upgrade-smoke
+```
+
+Use the container port the Dockerfile actually exposes (`8080` is the default since .NET 8). This catches the
+port/non-root user changes and missing native dependencies in the new base image.
+
+### If the smoke run fails
+
+Read the log, find the root cause, fix it (§6/§7), rebuild, re-run tests **and** the smoke run. Don't "fix" it by
+removing registrations, disabling middleware, or catching and swallowing the exception. If you can't fix it, do
+not commit — report the error and log excerpt to the user.
+
+Delete `smoke.log` / `smoke.err.log` afterwards (never commit them).
+
+### Optional: make it permanent (suggest, don't add without asking)
+
+Suggest to the user a small startup test so CI catches this in the future without a manual run:
+
+```csharp
+public class StartupSmokeTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>
+{
+    [Fact]
+    public async Task App_starts_and_health_endpoint_responds()
+    {
+        var client = factory.CreateClient();
+        var response = await client.GetAsync("/health");
+        Assert.True((int)response.StatusCode < 500);
+    }
+}
+```
+
 ## 11. Finish with a report
 
 ### Commit gate (mandatory)
@@ -467,16 +592,17 @@ git branch --show-current            # must be upgrade-net<MAJOR>
 dotnet restore
 dotnet build --no-restore --configuration Release
 dotnet test --no-build --configuration Release
+# + smoke run of every runnable project (§10a)
 ```
 
-- Commit **only if** the build has **0 errors** and **every test that passed at baseline still passes** (exit code
+- Commit **only if** the smoke run passes for every project that started at baseline, **and** the build has **0 errors** and **every test that passed at baseline still passes** (exit code
   0 from both commands, or, if the baseline already had failures, exactly the same failing tests and no new ones).
 - If the gate fails: do **not** commit, do **not** use `--no-verify`, do not stash the failure away. Go back to §6/§7,
   fix, and re-run the gate. If you cannot get it green, stop and report the failing build errors/tests to the user,
-  leaving the changes uncommitted on the branch.
+  leaving the changes uncommitted on the branch. Same for a failed smoke run.
 - Intermediate states (e.g. retargeted but packages not yet updated) usually don't build — that's fine, just don't
   commit them. It is OK to make a single commit at the end once everything is green.
-- Never commit `build.log`, `TestResults/`, `bin/`, `obj/` or other generated files — check `git status` first.
+- Never commit `build.log`, `smoke*.log`, `TestResults/`, `bin/`, `obj/` or other generated files — check `git status` first.
 
 When the gate passes, commit on `upgrade-net<MAJOR>` (one commit, or a few logical ones that each pass the gate):
 
@@ -504,7 +630,9 @@ Then give the user a summary:
    value), files found but intentionally unchanged, and values that live outside the repo (Azure DevOps variable
    groups, App Service runtime settings) that the user must update. Remind the user to run the pipeline on
    `upgrade-net<MAJOR>`.
-5. **Results**: build warnings before/after, tests passed/failed/skipped before/after.
+5. **Results**: build warnings before/after, tests passed/failed/skipped before/after, smoke run per runnable
+   project (started? URL checked + status code, container check) before/after, and projects that could not be
+   smoke-tested and why.
 6. **Needs human attention**: anything you could not verify or that affects runtime/deployment (connection-string
    encryption, container port 8080, DB compatibility level, pending EF migrations, BinaryFormatter data,
    packages already on a paid version, free versions with known vulnerabilities, infra outside the repo such as App Service / k8s runtime versions).
