@@ -110,7 +110,8 @@ dotnet test --no-build
 Record the number of warnings, errors, and failing tests. Pre-existing failures are **not** yours to fix, but you
 must not add new ones. If the baseline doesn't build, report this to the user and ask how to proceed.
 
-Also do the **baseline smoke run** (§10a) now and record, per runnable project, whether it starts.
+Also do the **baseline smoke run** (§10a) now: start each API with its launch profile, record whether Swagger
+loads, and save its Swagger JSON + list of operations (outside the repo) to compare after the upgrade.
 
 ## 4. Retarget the projects
 
@@ -459,7 +460,7 @@ dotnet test --no-build
 - If there is a `dotnet format` config, run `dotnet format --verify-no-changes` and fix only upgrade-related issues.
 - If the repo builds Docker images, run `docker build` for at least one if Docker is available.
 
-## 10a. Smoke run — start the app locally (mandatory before commit/push)
+## 10a. Smoke run — start the API locally (mandatory before commit/push)
 
 Build + tests are not enough: DI registration errors, missing configuration, middleware order, serializer and
 startup changes often only fail **when the app starts**. So every runnable project must be started locally and
@@ -469,7 +470,7 @@ checked before anything is committed or pushed.
 
 Find the runnable projects (skip test projects and class libraries):
 
-- `Sdk="Microsoft.NET.Sdk.Web"` → ASP.NET Core API / MVC / Razor / Blazor Server → **HTTP check**
+- `Sdk="Microsoft.NET.Sdk.Web"` → ASP.NET Core **Web API** → **Swagger check** (MVC / Razor / Blazor Server → status check)
 - `Sdk="Microsoft.NET.Sdk.Worker"` or `<OutputType>Exe</OutputType>` with a hosted service → **stays-alive check**
 - Plain console tools (`<OutputType>Exe</OutputType>`, exits by itself) → run only if it has a safe no-op mode
   (`--help`, `--version`, dry run); otherwise skip and report.
@@ -496,52 +497,93 @@ Do the smoke run once **before** the upgrade (part of §3) and record the result
 start at baseline either (e.g. needs a database you don't have), that is not an upgrade regression — report it and
 treat that project as "not smoke-testable", don't try to fix the environment.
 
-### HTTP check (web projects)
+### API check via Swagger (web API projects)
 
-Pick a free local port, start the app from its build output, wait until it answers, then stop it.
+Our APIs have **no `/health` endpoint**. Each API has a launch profile in `Properties/launchSettings.json` that
+opens Swagger when run locally (`"launchUrl": "swagger"`, `"ASPNETCORE_ENVIRONMENT": "Development"`). Use exactly
+that setup — Swagger is the smoke check:
+
+1. **Read `Properties/launchSettings.json`** of the API and pick the profile with `"commandName": "Project"`
+   (usually named `http`, `https` or the project name). From it take:
+   - the base URL: first `http://` entry of `applicationUrl` (use the `https://` one only if there is no http one),
+   - the Swagger path: `launchUrl` (e.g. `swagger`),
+   - the Swagger JSON path: from `Program.cs` / startup — `SwaggerDoc("v1", ...)` → `/swagger/v1/swagger.json`
+     (or the custom `RouteTemplate` if set). If the API uses the built-in `Microsoft.AspNetCore.OpenApi`
+     (`MapOpenApi()`), it's `/openapi/v1.json`.
+2. **Run with that launch profile** (`dotnet run` does not open a browser, it just uses the URL and environment
+   variables of the profile). Make sure the port is free first; if it is in use, report it instead of killing the
+   other process.
+3. **Wait for the Swagger UI** (`<base>/<launchUrl>/index.html`) to return **200**.
+4. **Download the Swagger JSON** — it must return **200** and be valid JSON with a non-empty `paths` object.
+   This is the most valuable check: generating the document touches every controller/endpoint, so it catches
+   ambiguous routes, broken model types, Swashbuckle / Microsoft.OpenApi 2.x incompatibilities and DI errors in
+   controllers' metadata.
+5. **Compare with the baseline**: save the Swagger JSON from the baseline run (§3) and from the upgraded run
+   **outside the repo** (temp folder). The list of paths + HTTP methods must be the same — a missing operation
+   means an endpoint was lost (e.g. a controller not discovered anymore). Schema formatting differences caused by
+   the Swashbuckle / OpenAPI version change are expected; list them in the report but don't treat them as failures.
+6. **Check the log** for `Unhandled exception`, `crit:` or `fail:` entries that weren't there at baseline.
+7. **Stop the API** — kill the whole process tree (`dotnet run` starts the API as a child process).
 
 ```bash
-# bash / Linux / macOS
-export ASPNETCORE_ENVIRONMENT=Development
-dotnet run --project src/MyApi/MyApi.csproj -c Release --no-build --no-launch-profile -- \
-  --urls http://127.0.0.1:5099 > smoke.log 2>&1 &
+# bash / Linux / macOS — values come from launchSettings.json
+PROJ=src/MyApi/MyApi.csproj; PROFILE=http; BASE=http://localhost:5099
+SWAGGER_UI=$BASE/swagger/index.html; SWAGGER_JSON=$BASE/swagger/v1/swagger.json
+OUT=$(mktemp -d)                                     # keep outputs out of the repo
+dotnet run --project $PROJ -c Release --no-build --launch-profile $PROFILE > $OUT/smoke.log 2>&1 &
 APP_PID=$!
 for i in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5099/health || true)
+  code=$(curl -sk -o /dev/null -w '%{http_code}' $SWAGGER_UI || true)
   [ "$code" != "000" ] && break; sleep 2
 done
-echo "HTTP $code"; kill $APP_PID; wait $APP_PID 2>/dev/null
-grep -nE 'Unhandled exception|crit:|fail:|Exception:' smoke.log
+echo "Swagger UI: HTTP $code"
+curl -sk -o $OUT/swagger.after.json -w 'Swagger JSON: HTTP %{http_code}\n' $SWAGGER_JSON
+jq -r '.paths | to_entries[] | .key as $p | .value | keys[] | select(IN("get","put","post","delete","patch","head","options")) | "\(ascii_upcase) \($p)"' $OUT/swagger.after.json | sort > $OUT/ops.after.txt
+wc -l < $OUT/ops.after.txt                           # number of operations
+pkill -P $APP_PID; kill $APP_PID; wait $APP_PID 2>/dev/null
+grep -nE 'Unhandled exception|crit:|fail:' $OUT/smoke.log
+# diff $OUT_BASELINE/ops.before.txt $OUT/ops.after.txt   → must be empty
 ```
 
 ```powershell
-# PowerShell / Windows
-$env:ASPNETCORE_ENVIRONMENT = "Development"
-$p = Start-Process dotnet -ArgumentList 'run --project src/MyApi/MyApi.csproj -c Release --no-build --no-launch-profile -- --urls http://127.0.0.1:5099' `
-     -RedirectStandardOutput smoke.log -RedirectStandardError smoke.err.log -PassThru -NoNewWindow
+# PowerShell / Windows — values come from launchSettings.json
+$proj = "src/MyApi/MyApi.csproj"; $profile = "http"; $base = "http://localhost:5099"
+$swaggerUi = "$base/swagger/index.html"; $swaggerJson = "$base/swagger/v1/swagger.json"
+$out = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "smoke-$(Get-Random)")   # outside the repo
+$p = Start-Process dotnet -ArgumentList "run --project $proj -c Release --no-build --launch-profile $profile" `
+     -RedirectStandardOutput "$out/smoke.log" -RedirectStandardError "$out/smoke.err.log" -PassThru -NoNewWindow
 $code = 0
 for ($i = 0; $i -lt 60 -and $code -eq 0; $i++) {
-  try { $code = (Invoke-WebRequest http://127.0.0.1:5099/health -UseBasicParsing -TimeoutSec 2).StatusCode }
+  try { $code = (Invoke-WebRequest $swaggerUi -UseBasicParsing -TimeoutSec 2).StatusCode }
   catch { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } else { Start-Sleep 2 } }
 }
-"HTTP $code"; Stop-Process -Id $p.Id -Force
-Select-String -Path smoke.log, smoke.err.log -Pattern 'Unhandled exception|crit:|fail:|Exception:'
+"Swagger UI: HTTP $code"
+Invoke-WebRequest $swaggerJson -UseBasicParsing -OutFile "$out/swagger.after.json"
+$doc = Get-Content "$out/swagger.after.json" -Raw | ConvertFrom-Json
+$ops = foreach ($path in $doc.paths.PSObject.Properties) { foreach ($m in $path.Value.PSObject.Properties | Where-Object Name -in 'get','put','post','delete','patch','head','options') { "$($m.Name.ToUpper()) $($path.Name)" } }
+$ops | Sort-Object | Set-Content "$out/ops.after.txt"; "operations: $(@($ops).Count)"
+taskkill /PID $p.Id /T /F | Out-Null                 # kills dotnet run AND the API child process
+Select-String -Path "$out/smoke.log", "$out/smoke.err.log" -Pattern 'Unhandled exception|crit:|fail:'
+# Compare-Object (Get-Content $baselineOut/ops.before.txt) (Get-Content "$out/ops.after.txt")  → must be empty
 ```
 
-Which URL to call, in this order (use the first one the app has): the health check endpoint
-(`MapHealthChecks("/health" | "/healthz" | "/hc")`), `/swagger/index.html` or `/openapi/v1.json`, a simple anonymous
-GET endpoint, otherwise `/`.
+If the profile only has an `https://` URL, the local dev certificate is used: keep `curl -k`; in PowerShell 7 add
+`-SkipCertificateCheck` to `Invoke-WebRequest`. If `jq` isn't installed, parse the JSON with any available tool
+(PowerShell, `python3 -c`, `node -e`).
 
 **Pass** when all of these hold:
-- the process is still running after startup (didn't exit/crash),
-- the URL returned a status **< 500** (401/403/404 are OK — the app is up; 5xx or no answer within ~2 min is a fail),
-- the log contains no `Unhandled exception`, `crit:` or startup `fail:` entries that weren't there at baseline
-  (e.g. DI `Unable to resolve service for type ...`, `InvalidOperationException` at startup, options validation
-  errors, EF model/migration errors).
+- the API process is still running after startup (didn't exit/crash),
+- Swagger UI returned **200** and the Swagger JSON returned **200** with valid JSON,
+- the operations (method + path) are the same as at baseline,
+- the log has no new `Unhandled exception` / `crit:` / `fail:` entries (e.g. DI `Unable to resolve service for
+  type ...`, `InvalidOperationException` at startup, options validation errors, EF model errors).
+
+Other web projects without Swagger (MVC, Razor Pages, Blazor Server): same run, but check that `/` (or the profile's
+`launchUrl`) returns a status **< 500**.
 
 ### Stays-alive check (workers / background services)
 
-Start it the same way (no URL), wait ~30 seconds, then check: the process is still running and the log has no new
+Start it the same way (its launch profile, no URL), wait ~30 seconds, then check: the process is still running and the log has no new
 `Unhandled exception` / `crit:` / `fail:` entries compared to baseline. Then stop it.
 
 ### Container check (if the repo has a Dockerfile and Docker is available)
@@ -549,11 +591,12 @@ Start it the same way (no URL), wait ~30 seconds, then check: the process is sti
 ```bash
 docker build -t upgrade-smoke -f src/MyApi/Dockerfile .
 docker run -d --name upgrade-smoke -p 5098:8080 -e ASPNETCORE_ENVIRONMENT=Development upgrade-smoke
-# same HTTP check against http://127.0.0.1:5098/health, then:
+# same Swagger check against http://127.0.0.1:5098/swagger/index.html and /swagger/v1/swagger.json, then:
 docker logs upgrade-smoke; docker rm -f upgrade-smoke
 ```
 
-Use the container port the Dockerfile actually exposes (`8080` is the default since .NET 8). This catches the
+Use the container port the Dockerfile actually exposes (`8080` is the default since .NET 8). Swagger is usually
+only enabled in `Development`, which is why the container is started with that environment for this check. This catches the
 port/non-root user changes and missing native dependencies in the new base image.
 
 ### If the smoke run fails
@@ -562,7 +605,7 @@ Read the log, find the root cause, fix it (§6/§7), rebuild, re-run tests **and
 removing registrations, disabling middleware, or catching and swallowing the exception. If you can't fix it, do
 not commit — report the error and log excerpt to the user.
 
-Delete `smoke.log` / `smoke.err.log` afterwards (never commit them).
+Delete the temp output folder afterwards (never commit logs or Swagger JSON files).
 
 ### Optional: make it permanent (suggest, don't add without asking)
 
@@ -572,11 +615,12 @@ Suggest to the user a small startup test so CI catches this in the future withou
 public class StartupSmokeTests(WebApplicationFactory<Program> factory) : IClassFixture<WebApplicationFactory<Program>>
 {
     [Fact]
-    public async Task App_starts_and_health_endpoint_responds()
+    public async Task Api_starts_and_swagger_document_is_generated()
     {
-        var client = factory.CreateClient();
-        var response = await client.GetAsync("/health");
-        Assert.True((int)response.StatusCode < 500);
+        var client = factory.WithWebHostBuilder(b => b.UseEnvironment("Development")).CreateClient();
+        var response = await client.GetAsync("/swagger/v1/swagger.json");
+        response.EnsureSuccessStatusCode();   // fails on DI/startup errors and broken Swagger generation
+        Assert.Contains("\"paths\"", await response.Content.ReadAsStringAsync());
     }
 }
 ```
@@ -630,8 +674,9 @@ Then give the user a summary:
    value), files found but intentionally unchanged, and values that live outside the repo (Azure DevOps variable
    groups, App Service runtime settings) that the user must update. Remind the user to run the pipeline on
    `upgrade-net<MAJOR>`.
-5. **Results**: build warnings before/after, tests passed/failed/skipped before/after, smoke run per runnable
-   project (started? URL checked + status code, container check) before/after, and projects that could not be
+5. **Results**: build warnings before/after, tests passed/failed/skipped before/after, smoke run per API
+   (Swagger UI + Swagger JSON status, number of operations before/after, missing/new operations, container
+   check) before/after, and projects that could not be
    smoke-tested and why.
 6. **Needs human attention**: anything you could not verify or that affects runtime/deployment (connection-string
    encryption, container port 8080, DB compatibility level, pending EF migrations, BinaryFormatter data,
