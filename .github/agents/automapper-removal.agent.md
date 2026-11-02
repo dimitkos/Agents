@@ -66,29 +66,43 @@ word:
 ```csharp
 public interface ICustomerMapper
 {
-    CustomerDto ToDto(Customer source);
-    IReadOnlyList<CustomerDto> ToDtos(IEnumerable<Customer> source);
+    CustomerModel Map(Customer source);
+    IReadOnlyList<CustomerModel> Map(IEnumerable<Customer> source);
+    Customer Map(CreateCustomerRequest source);
+    void Map(UpdateCustomerRequest source, Customer target);      // update an existing object in place
 }
 
 public sealed class CustomerMapper : ICustomerMapper
 {
-    public CustomerDto ToDto(Customer source)
+    public CustomerModel Map(Customer source)
     {
         ArgumentNullException.ThrowIfNull(source);
 
-        return new CustomerDto(
+        return new CustomerModel(
             id: source.Id,
             fullName: $"{source.FirstName} {source.LastName}",
             city: source.Address?.City);
     }
 
-    public IReadOnlyList<CustomerDto> ToDtos(IEnumerable<Customer> source)
-        => source?.Select(ToDto).ToList() ?? [];
+    public IReadOnlyList<CustomerModel> Map(IEnumerable<Customer> source)
+        => source?.Select(x => Map(x)).ToList() ?? [];   // lambda, not method group: Map is overloaded
+
+    // Map(CreateCustomerRequest) and Map(UpdateCustomerRequest, Customer) omitted for brevity
 }
 ```
 
-- Interface + `sealed` class. Method names describe the direction: `ToDto`, `ToEntity`, `ToResponse`,
-  `ToViewModel`, `ToCommand` … (one method per source → destination pair; overloads are fine).
+- Interface + `sealed` class.
+- **Every mapping method is called `Map`** — never `ToDto`, `ToModel`, `ToEntity`, `ToResponse`, `Convert` etc.
+  The source type picks the overload:
+  - `Map(Customer source)` → returns the destination,
+  - `Map(IEnumerable<Customer> source)` → returns the list,
+  - `Map(UpdateCustomerRequest source, Customer target)` → `void`, updates an existing object.
+- **Only exception** — the same source type maps to **more than one** destination type in the same mapper
+  (C# can't overload on the return type): keep `Map` for the main one and name the others
+  `MapTo<DestinationType>`, e.g. `Map(Customer) → CustomerModel` and `MapToCustomerSummary(Customer) →
+  CustomerSummary`. Use this only when really needed.
+- Keep the existing destination class names (`CustomerDto`, `CustomerModel`, `CustomerResponse` …) — renaming them
+  is not part of this job. The examples here use `CustomerModel`.
 - Registered in DI where `AddAutoMapper(...)` was, through one extension method per project, e.g.
   `services.AddMappers()`. Lifetime: **Singleton** when the mapper is stateless (the normal case); **Scoped** if it
   needs a scoped service (e.g. a value resolver that used a `DbContext`).
@@ -103,13 +117,13 @@ public sealed class CustomerMapper : ICustomerMapper
 **Mapped objects (destination types): get-only properties, constructor only**
 
 ```csharp
-public class CustomerDto
+public class CustomerModel
 {
     public int Id { get; }
     public string FullName { get; }
     public string? City { get; }
 
-    public CustomerDto(int id, string fullName, string? city)
+    public CustomerModel(int id, string fullName, string? city)
     {
         Id = id;
         FullName = fullName;
@@ -133,7 +147,7 @@ the report:
   EF change tracking and navigation properties need them as they are.
 - Types that AutoMapper **updated in place** (`_mapper.Map(source, existingDestination)`), typically entities in
   update endpoints. Replace these with an explicit update method on the mapper, e.g.
-  `void Apply(UpdateCustomerRequest source, Customer target)`, which sets the same properties AutoMapper set.
+  `void Map(UpdateCustomerRequest source, Customer target)`, which sets the same properties AutoMapper set.
 - Request models bound from **query string, route or form** (`[FromQuery]`, `[FromRoute]`, `[FromForm]`, or no
   attribute on a GET) — MVC model binding for those needs setters or a record-style constructor; only convert them
   if an existing test or the smoke run proves binding still works. JSON bodies (`[FromBody]`) are fine to convert.
@@ -237,7 +251,7 @@ AutoMapper does a lot implicitly. For each map, the hand-written code must match
 | `NullSubstitute(x)` | `value ?? x` |
 | Null source object | `Map<T>(null)` returned `null` → mapper methods for nullable inputs return `null`; keep `ThrowIfNull` only where the source can never be null |
 | Null source collection | becomes an **empty** collection (unless `AllowNullCollections = true`) → `source.Items?.Select(...).ToList() ?? []` |
-| Collection of A → collection of B | `.Select(itemMapper.ToDto).ToList()` (same collection type as the destination property) |
+| Collection of A → collection of B | `.Select(x => itemMapper.Map(x)).ToList()` (same collection type as the destination property) |
 | Nested object with its own map | call the nested mapper |
 | Enum → enum | check the AutoMapper version in use and test it: map explicitly (switch expression) by the same rule; add a test per value |
 | Enum ↔ string | `value.ToString()` / `Enum.Parse<T>(value)` |
@@ -249,7 +263,7 @@ AutoMapper does a lot implicitly. For each map, the hand-written code must match
 | `ReverseMap()` | a second, explicit method for the other direction — only if it is actually used |
 | `Include` / `IncludeBase` (inheritance) | a `switch` on the runtime type that calls the derived mapping, base members mapped in a shared private method |
 | `MaxDepth` / `PreserveReferences` (cycles) | stop the recursion explicitly at the same depth; report it |
-| `Map(source, existingDestination)` | `void Apply(source, target)` setting the same members (see §0) |
+| `Map(source, existingDestination)` | `void Map(source, target)` on the mapper, setting the same members (see §0) |
 | `ProjectTo<TDest>()` on `IQueryable` | see §6 — must stay translatable to SQL |
 
 **Logic in profiles goes into the mapper**: string formatting, calculations, lookups, defaults, date conversions,
@@ -267,7 +281,7 @@ Do this **while AutoMapper is still installed**:
    serialize both to JSON and compare).
 3. Once they pass, turn them into normal unit tests with **explicit expected values** (copy the values AutoMapper
    produced), so they keep working after AutoMapper is removed. Name them after the behavior, e.g.
-   `ToDto_maps_full_name_from_first_and_last_name`, `ToDto_returns_empty_orders_when_source_orders_null`.
+   `Map_sets_full_name_from_first_and_last_name`, `Map_returns_empty_orders_when_source_orders_null`.
 4. Every piece of logic moved from a profile gets at least one test.
 
 If an AutoMapper result looks like a bug (e.g. culture-dependent formatting, a silently swallowed null), **keep the
@@ -278,9 +292,10 @@ behavior** and list it in the report as "possible bug, not changed".
 - Constructor injection: `IMapper mapper` → the specific mapper interface(s) the class actually needs
   (`ICustomerMapper customerMapper`). Rename the field accordingly. If a class used many different maps, inject
   several mappers; if that gets above ~4, report it as a design smell but still do it.
-- `_mapper.Map<CustomerDto>(customer)` → `_customerMapper.ToDto(customer)`.
-- `_mapper.Map<List<CustomerDto>>(customers)` → `_customerMapper.ToDtos(customers)`.
-- `_mapper.Map(request, customer)` → `_customerMapper.Apply(request, customer)`.
+- `_mapper.Map<CustomerModel>(customer)` → `_customerMapper.Map(customer)`.
+- `_mapper.Map<List<CustomerModel>>(customers)` → `_customerMapper.Map(customers)` (if the call site needs a
+  `List<T>`, add `.ToList()` there or let the overload return the same collection type AutoMapper produced).
+- `_mapper.Map(request, customer)` → `_customerMapper.Map(request, customer)`.
 - **`ProjectTo<TDest>(_mapper.ConfigurationProvider)`** — the query must still be translated to SQL (never load
   entities into memory and map them there — that changes performance and the generated SQL). Add an expression
   to the mapper and use it in `Select`:
@@ -288,12 +303,12 @@ behavior** and list it in the report as "possible bug, not changed".
   ```csharp
   public interface ICustomerMapper
   {
-      Expression<Func<Customer, CustomerDto>> Projection { get; }
+      Expression<Func<Customer, CustomerModel>> Projection { get; }
       ...
   }
 
-  public Expression<Func<Customer, CustomerDto>> Projection { get; } = c =>
-      new CustomerDto(c.Id, c.FirstName + " " + c.LastName, c.Address != null ? c.Address.City : null);
+  public Expression<Func<Customer, CustomerModel>> Projection { get; } = c =>
+      new CustomerModel(c.Id, c.FirstName + " " + c.LastName, c.Address != null ? c.Address.City : null);
 
   // usage
   var result = await db.Customers.Where(...).Select(_customerMapper.Projection).ToListAsync(ct);
@@ -310,7 +325,7 @@ behavior** and list it in the report as "possible bug, not changed".
 For each destination type that should be converted (§0):
 
 1. Make every property `{ get; }`, add the single public constructor setting all of them.
-2. Fix **every** place that created it with an object initializer (`new CustomerDto { Id = 1, ... }`) or set a
+2. Fix **every** place that created it with an object initializer (`new CustomerModel { Id = 1, ... }`) or set a
    property later — in production code **and** tests. If code set properties after creation (e.g. filled in
    `TotalCount` later), build the full object in one go instead; if that's impossible without a logic change, keep
    the type settable and report it.
