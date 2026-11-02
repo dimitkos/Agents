@@ -30,6 +30,8 @@ Work in small, verifiable steps. Never declare success without a green `dotnet b
 - All work happens on a dedicated branch named `upgrade-net<MAJOR>` (e.g. `upgrade-net10`, `upgrade-net12`) — see §2a.
   Never commit the upgrade directly to `main`/`master`/`develop`.
 - **Nothing is committed unless `dotnet build` and `dotnet test` pass** — see §11 (commit gate).
+- **Never upgrade a package into a paid / commercial-license version** (e.g. AutoMapper 15+, MediatR 13+).
+  Stay on the **latest free version** instead — see §5a.
 
 ---
 
@@ -154,11 +156,65 @@ Order matters — do it in this sequence:
 
 Typical test-stack packages to bump together: `Microsoft.NET.Test.Sdk`, `xunit` / `xunit.v3`,
 `xunit.runner.visualstudio`, `NUnit`, `NUnit3TestAdapter`, `MSTest.*`, `coverlet.*`, `Moq` / `NSubstitute`,
-`FluentAssertions` (note: v8+ has a commercial license — do **not** upgrade past v7 without asking the user),
-`Testcontainers.*`.
+`FluentAssertions` (max **7.x** — see §5a), `Testcontainers.*`.
 
-Also check other packages with license changes before a major bump (e.g. `MediatR` 13+, `AutoMapper` 15+,
-`MassTransit` 9+). Ask the user before upgrading across a license change.
+## 5a. Paid packages — stay on the latest free version (mandatory)
+
+Some popular libraries moved to a commercial license in a new major version. **Never** upgrade a package into a
+paid/commercial version. Instead, upgrade it to the **highest version that is still free** (open-source license),
+even if the project is currently on an older free version.
+
+Known cut-offs (check every package in the repo against this list):
+
+| Package (and its companions)                                        | Last free line (license) | Latest free (Nov 2026) | Paid from | Note |
+|---------------------------------------------------------------------|--------------------------|------------------------|-----------|------|
+| `AutoMapper`, `AutoMapper.Extensions.Microsoft.DependencyInjection` | **14.x** (MIT)           | 14.0.0                 | 15.0      | 14.0.0 has advisory GHSA-rvv3-g6hj-g44x (fix only in paid) — see rule 6 |
+| `MediatR`, `MediatR.Contracts`                                      | **12.x** (Apache-2.0)    | 12.5.0                 | 13.0      | |
+| `MassTransit`, `MassTransit.*`                                      | **8.x** (Apache-2.0)     | 8.5.x                  | 9.0       | |
+| `FluentAssertions`, `FluentAssertions.*`                            | **7.x** (Apache-2.0)     | 7.2.x                  | 8.0       | |
+| `SixLabors.ImageSharp`, `SixLabors.*`                               | **2.x** (Apache-2.0)     | 2.1.x                  | 3.0 (Six Labors Split License) | 2.1.x has known advisories — see rule 6 |
+| `EPPlus`                                                            | **4.5.x** (LGPL)         | 4.5.3.3                | 5.0 (Polyform Noncommercial / commercial) | |
+| `IdentityServer4` → `Duende.IdentityServer`                         | stay on what is there    | —                      | Duende is commercial | never switch to it |
+
+Rules:
+
+1. **Find the cap**: for each listed package, query the available versions
+   (`https://api.nuget.org/v3-flatcontainer/<package-id-lowercase>/index.json`) and pick the **highest stable
+   version below the "Paid from" major**. Example: AutoMapper on 12.0.1 → upgrade to the latest **14.x**, not 15.
+2. **Companion packages** must stay consistent with the main one (e.g. AutoMapper ≤ 14 together with its DI
+   package only where that package still applies; `MassTransit.*` all on the same 8.x version).
+   Note: since AutoMapper 13 and MediatR 12 the DI registration is built in — the old
+   `*.Extensions.Microsoft.DependencyInjection` package must be removed when moving to those versions, and the
+   registration code adjusted (`services.AddAutoMapper(...)`, `services.AddMediatR(cfg => ...)`).
+3. **Pin the cap** so tools/Dependabot/Renovate don't bump it later. Add a comment next to the version, e.g. in
+   `Directory.Packages.props` or the `.csproj`:
+   ```xml
+   <!-- Do not upgrade to 15+ : commercial license. Latest free major is 14. -->
+   <PackageVersion Include="AutoMapper" Version="14.0.0" />
+   ```
+   If the repo has `dependabot.yml` / `renovate.json`, add an `ignore` rule for versions ≥ the paid major
+   (report it to the user if you can't).
+4. **If the project is already on a paid version** (e.g. AutoMapper 15 is already referenced), do **not** downgrade
+   silently — the company may hold a license. Leave it, and ask/report it under "needs human attention".
+5. **Any other package** whose next major changes from an OSI open-source license (MIT, Apache-2.0, BSD, LGPL…) to a
+   commercial, "source-available", dual/revenue-based, or non-commercial license: treat it the same way — stay on the
+   latest free version. Check the license on `https://www.nuget.org/packages/<id>/<version>` (license field /
+   `licenseUrl`) or the project's release notes **before** every major bump of a third-party package.
+6. **The free version must still work on the target .NET** (build + tests green). If the last free version is not
+   compatible, or has a known vulnerability (`dotnet list package --vulnerable`) with the fix only in the paid
+   version: do **not** upgrade to paid — keep the latest free version, and report it clearly to the user with options
+   (buy a license, or replace the library, e.g. AutoMapper → Mapster / manual mapping, MediatR → Mediator / a simple
+   in-house dispatcher, FluentAssertions → Shouldly / AwesomeAssertions). Don't replace libraries yourself unless
+   asked.
+   If the repo uses `TreatWarningsAsErrors` and the NuGet audit warning (`NU1901`–`NU1904`) for that free version
+   breaks the build, suppress **only that exact advisory** with a comment, and list it under "needs human
+   attention":
+   ```xml
+   <!-- Kept AutoMapper 14 (last free version). Fix only exists in paid 15+. Decision needed: license or replace. -->
+   <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-rvv3-g6hj-g44x" />
+   ```
+7. The table above is from the time this agent was written — if in doubt about a package's license for a version,
+   check nuget.org rather than trusting memory.
 
 ## 6. Build, fix, repeat
 
@@ -440,7 +496,9 @@ Then give the user a summary:
 
 1. **Upgrade**: from → to, SDK version, projects changed, branch name (`upgrade-net<MAJOR>`) and commit hash(es).
 2. **Packages**: table of package / old version / new version; packages removed; packages intentionally **not**
-   upgraded and why (license change, risky major, no compatible version).
+   upgraded and why (risky major, no compatible version).
+   Separate list **"Kept on latest free version"**: package / current version / latest free version used / first
+   paid version (e.g. `AutoMapper 12.0.1 → 14.0.0, paid from 15.0`).
 3. **Code changes**: each breaking change fixed, with file references.
 4. **Pipelines & Docker**: every pipeline YAML / Dockerfile / compose / deployment file changed (old → new
    value), files found but intentionally unchanged, and values that live outside the repo (Azure DevOps variable
@@ -449,4 +507,4 @@ Then give the user a summary:
 5. **Results**: build warnings before/after, tests passed/failed/skipped before/after.
 6. **Needs human attention**: anything you could not verify or that affects runtime/deployment (connection-string
    encryption, container port 8080, DB compatibility level, pending EF migrations, BinaryFormatter data,
-   license changes, infra outside the repo such as App Service / k8s runtime versions).
+   packages already on a paid version, free versions with known vulnerabilities, infra outside the repo such as App Service / k8s runtime versions).
