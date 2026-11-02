@@ -5,6 +5,7 @@ Custom agents for GitHub Copilot.
 | Agent | File | What it does |
 |-------|------|--------------|
 | `dotnet-lts-upgrade` | [.github/agents/dotnet-lts-upgrade.agent.md](.github/agents/dotnet-lts-upgrade.agent.md) | Upgrades a .NET solution to the latest LTS (e.g. 6 → 8, 8 → 10) on a new `upgrade-net<MAJOR>` branch: target frameworks, `global.json`, NuGet packages, breaking changes, pipeline YAML and Dockerfiles. Never upgrades packages into paid licenses (AutoMapper, MediatR, MassTransit, FluentAssertions …) — keeps the latest free version. Commits only after build, tests and a local smoke run (API starts and Swagger loads with no runtime errors) pass. |
+| `automapper-removal` | [.github/agents/automapper-removal.agent.md](.github/agents/automapper-removal.agent.md) | Removes AutoMapper (now commercial) and replaces it with injectable hand-written mappers on a `remove-automapper` branch. Moves profile logic into the mappers, makes mapped objects immutable (get-only properties + constructor), replaces `ProjectTo` with EF-translatable projections, proves same behavior with characterization tests, fixes tests. Commits only after build, tests and a Swagger smoke run pass. |
 
 ## How to use an agent in a project
 
