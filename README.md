@@ -4,7 +4,7 @@ Custom agents for GitHub Copilot.
 
 | Agent | File | What it does |
 |-------|------|--------------|
-| `dotnet-lts-upgrade` | [.github/agents/dotnet-lts-upgrade.agent.md](.github/agents/dotnet-lts-upgrade.agent.md) | Upgrades a .NET solution to the latest LTS (e.g. 6 → 8, 8 → 10) on a new `upgrade-net<MAJOR>` branch: target frameworks, `global.json`, NuGet packages, breaking changes, pipeline YAML and Dockerfiles. Commits only after build and tests pass. |
+| `dotnet-lts-upgrade` | [.github/agents/dotnet-lts-upgrade.agent.md](.github/agents/dotnet-lts-upgrade.agent.md) | Upgrades a .NET solution to the latest LTS (e.g. 6 → 8, 8 → 10) on a new `upgrade-net<MAJOR>` branch: target frameworks, `global.json`, NuGet packages, breaking changes, pipeline YAML and Dockerfiles. Never upgrades packages into paid licenses (AutoMapper, MediatR, MassTransit, FluentAssertions …) — keeps the latest free version. Commits only after build and tests pass. |
 
 ## How to use an agent in a project
 
