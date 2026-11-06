@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Service summary",
+  "description": "Machine-readable summary of one documented service, used by the overview mode of the service-documentation agent.",
+  "type": "object",
+  "required": ["service", "repository", "deployables", "endpoints", "functions", "messages", "dependencies"],
+  "properties": {
+    "service": { "type": "string", "description": "Service name" },
+    "repository": { "type": "string" },
+    "summary": { "type": "string", "description": "In short, business language" },
+    "previousOwner": { "type": ["string", "null"] },
+    "dotnet": { "type": "array", "items": { "type": "string" }, "description": "Target frameworks, e.g. net8.0" },
+    "deployables": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "kind", "hosting"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "enum": ["api", "function-app", "worker", "cronjob", "web", "other"] },
+          "hosting": { "enum": ["aks", "azure-functions", "app-service", "container-apps", "other", "unknown"] },
+          "details": { "type": "string", "description": "namespace, plan, app name …" }
+        }
+      }
+    },
+    "endpoints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["method", "route"],
+        "properties": {
+          "method": { "type": "string" },
+          "route": { "type": "string" },
+          "auth": { "type": "string" },
+          "purpose": { "type": "string" },
+          "doc": { "type": "string", "description": "relative path of the doc page" }
+        }
+      }
+    },
+    "functions": {
+      "type": "array",
+      "description": "Azure Functions, background services, consumers, scheduled jobs",
+      "items": {
+        "type": "object",
+        "required": ["name", "trigger"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "enum": ["azure-function", "background-service", "consumer", "scheduled-job", "cronjob"] },
+          "trigger": { "type": "string", "description": "servicebus / timer / http / blob / eventgrid / …" },
+          "source": { "type": "string", "description": "topic+subscription, queue, schedule, route …" },
+          "purpose": { "type": "string" },
+          "doc": { "type": "string" }
+        }
+      }
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "direction", "channel"],
+        "properties": {
+          "type": { "type": "string", "description": "message contract name" },
+          "direction": { "enum": ["publishes", "consumes"] },
+          "channel": { "type": "string", "description": "topic, topic/subscription or queue name" },
+          "transport": { "type": "string", "description": "servicebus / eventgrid / eventhubs / storage-queue / rabbitmq" }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "kind"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "enum": ["database", "cache", "storage", "messaging", "http-api", "internal-service", "identity", "other"] },
+          "target": { "type": "string", "description": "e.g. config key of the base URL, database name — never secrets" },
+          "usedBy": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "properties": {
+        "high": { "type": "integer" },
+        "medium": { "type": "integer" },
+        "low": { "type": "integer" },
+        "openQuestions": { "type": "integer" }
+      }
+    }
+  }
+}
